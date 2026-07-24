@@ -10,7 +10,7 @@ import warnings
 # Suppress non-critical library warnings in CLI output
 warnings.filterwarnings("ignore")
 
-# Fix Windows console encoding for emojis and special characters
+# Fix Windows console encoding for special characters
 if sys.platform == "win32":
     os.system("")  # Enable ANSI/VT100 escape sequences on Windows
     if hasattr(sys.stdout, "reconfigure"):
@@ -24,14 +24,19 @@ from config import settings
 
 def main():
     print("=" * 60)
-    print("  LangGraph AI Personal Assistant CLI Interactive Shell")
+    print("  LangGraph AI Personal Assistant CLI")
     print("=" * 60)
     
-    # Display model cascade info
+    # Display model cascade info grouped by provider
     cascade = settings.get_model_cascade()
     print(f"\n  Model Cascade ({len(cascade)} models):")
-    for i, model in enumerate(cascade, 1):
-        print(f"    {i}. {model}")
+    current_provider = None
+    for provider, model in cascade:
+        if provider != current_provider:
+            provider_label = "Google Gemini" if provider == "gemini" else "OpenRouter"
+            print(f"    [{provider_label}]")
+            current_provider = provider
+        print(f"      -> {model}")
     print()
     
     session_thread_id = f"cli-session-{str(uuid.uuid4())[:8]}"

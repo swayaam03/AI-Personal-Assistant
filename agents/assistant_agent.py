@@ -1,9 +1,11 @@
 import re
 import uuid
 import logging
-from typing import Any, List, Optional
+import concurrent.futures
+from typing import Any, List, Optional, Tuple
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from config import settings
 from tools import ALL_TOOLS
 
@@ -137,54 +139,87 @@ class SimulatedAgentModel:
         return AIMessage(content=f"{greeting} I am {assistant_name}. How can I assist you with calculations, weather, web search, or text summarization today?")
 
 
-def create_agent_model_for(model_name: str) -> Any:
-    """
-    Creates a ChatGoogleGenerativeAI instance bound to tools for a specific model.
-    Uses max_retries=0 and a 15-second timeout so quota failures are fast.
-    """
+# ─── Model Factory Functions ───
+
+def create_gemini_model(model_name: str) -> Any:
+    """Creates a Gemini model instance bound to tools."""
     llm = ChatGoogleGenerativeAI(
         model=model_name,
         google_api_key=settings.GEMINI_API_KEY or "placeholder",
         temperature=0.7,
         max_retries=0,
-        timeout=15,        # HTTP request timeout in seconds
+        timeout=15,
     )
     return llm.bind_tools(ALL_TOOLS)
 
 
+def create_openrouter_model(model_name: str) -> Any:
+    """
+    Creates an OpenRouter model instance bound to tools.
+    OpenRouter uses an OpenAI-compatible API at https://openrouter.ai/api/v1
+    """
+    llm = ChatOpenAI(
+        model=model_name,
+        api_key=settings.OPENROUTER_API_KEY or "placeholder",
+        base_url="https://openrouter.ai/api/v1",
+        temperature=0.7,
+        max_retries=0,
+        timeout=15,
+        default_headers={
+            "HTTP-Referer": "https://github.com/swayaam03/AI-Personal-Assistant",
+            "X-Title": "AI Personal Assistant",
+        },
+    )
+    return llm.bind_tools(ALL_TOOLS)
+
+
+def create_model_for(provider: str, model_name: str) -> Any:
+    """Factory function that creates the right model based on provider."""
+    if provider == "gemini":
+        return create_gemini_model(model_name)
+    elif provider == "openrouter":
+        return create_openrouter_model(model_name)
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+
+
+# ─── Multi-Provider Model Cascade ───
+
 def invoke_with_model_cascade(messages: List[BaseMessage]) -> Optional[AIMessage]:
     """
-    Tries each model in the cascade list (from GEMINI_MODELS env var).
+    Tries each model in the cascade list across all configured providers.
     If a model's quota is exhausted (429) or unavailable (404), moves to the next.
-    Returns None if all models fail.
+    Returns None if ALL models across ALL providers fail.
+    
+    Cascade order is determined by settings.get_model_cascade() which returns
+    tuples of (provider, model_name).
     """
-    import concurrent.futures
-
     model_cascade = settings.get_model_cascade()
 
-    for model_name in model_cascade:
+    for provider, model_name in model_cascade:
         try:
-            llm_with_tools = create_agent_model_for(model_name)
+            llm_with_tools = create_model_for(provider, model_name)
             # Use a thread-based timeout to prevent hanging on slow API calls
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(llm_with_tools.invoke, messages)
                 response = future.result(timeout=20)  # 20s hard timeout per model
-            logger.debug(f"Successfully used model: {model_name}")
+            logger.debug(f"[CASCADE] Success: {provider}/{model_name}")
             return response
         except concurrent.futures.TimeoutError:
-            logger.debug(f"Model '{model_name}' timed out after 20s. Trying next model...")
+            logger.debug(f"[CASCADE] Timeout: {provider}/{model_name} (20s). Trying next...")
             continue
         except Exception as e:
             error_str = str(e)
-            # Log which model failed and why, then try the next one
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                logger.debug(f"Model '{model_name}' quota exhausted. Trying next model...")
+                logger.debug(f"[CASCADE] Quota exhausted: {provider}/{model_name}. Trying next...")
             elif "404" in error_str or "NOT_FOUND" in error_str:
-                logger.debug(f"Model '{model_name}' not available. Trying next model...")
+                logger.debug(f"[CASCADE] Not found: {provider}/{model_name}. Trying next...")
             elif "403" in error_str or "PERMISSION_DENIED" in error_str:
-                logger.debug(f"Model '{model_name}' permission denied. Trying next model...")
+                logger.debug(f"[CASCADE] Permission denied: {provider}/{model_name}. Trying next...")
+            elif "401" in error_str or "UNAUTHENTICATED" in error_str:
+                logger.debug(f"[CASCADE] Invalid API key: {provider}/{model_name}. Trying next...")
             else:
-                logger.debug(f"Model '{model_name}' failed: {error_str}. Trying next model...")
+                logger.debug(f"[CASCADE] Error: {provider}/{model_name}: {error_str[:100]}. Trying next...")
             continue
 
     # All models in cascade exhausted
@@ -194,4 +229,4 @@ def invoke_with_model_cascade(messages: List[BaseMessage]) -> Optional[AIMessage
 # Legacy single-model function (kept for backward compatibility)
 def create_agent_model() -> Any:
     """Creates agent model for the primary GEMINI_MODEL setting."""
-    return create_agent_model_for(settings.GEMINI_MODEL)
+    return create_gemini_model(settings.GEMINI_MODEL)
