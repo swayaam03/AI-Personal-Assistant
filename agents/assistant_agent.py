@@ -1,7 +1,6 @@
 import re
 import uuid
 import logging
-import concurrent.futures
 from typing import Any, List, Optional, Tuple
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -148,7 +147,7 @@ def create_gemini_model(model_name: str) -> Any:
         google_api_key=settings.GEMINI_API_KEY or "placeholder",
         temperature=0.7,
         max_retries=0,
-        timeout=15,
+        timeout=30,
     )
     return llm.bind_tools(ALL_TOOLS)
 
@@ -164,7 +163,7 @@ def create_openrouter_model(model_name: str) -> Any:
         base_url="https://openrouter.ai/api/v1",
         temperature=0.7,
         max_retries=0,
-        timeout=15,
+        request_timeout=30,
         default_headers={
             "HTTP-Referer": "https://github.com/swayaam03/AI-Personal-Assistant",
             "X-Title": "AI Personal Assistant",
@@ -190,24 +189,15 @@ def invoke_with_model_cascade(messages: List[BaseMessage]) -> Optional[AIMessage
     Tries each model in the cascade list across all configured providers.
     If a model's quota is exhausted (429) or unavailable (404), moves to the next.
     Returns None if ALL models across ALL providers fail.
-    
-    Cascade order is determined by settings.get_model_cascade() which returns
-    tuples of (provider, model_name).
     """
     model_cascade = settings.get_model_cascade()
 
     for provider, model_name in model_cascade:
         try:
             llm_with_tools = create_model_for(provider, model_name)
-            # Use a thread-based timeout to prevent hanging on slow API calls
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(llm_with_tools.invoke, messages)
-                response = future.result(timeout=20)  # 20s hard timeout per model
+            response = llm_with_tools.invoke(messages)
             logger.debug(f"[CASCADE] Success: {provider}/{model_name}")
             return response
-        except concurrent.futures.TimeoutError:
-            logger.debug(f"[CASCADE] Timeout: {provider}/{model_name} (20s). Trying next...")
-            continue
         except Exception as e:
             error_str = str(e)
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
@@ -218,8 +208,10 @@ def invoke_with_model_cascade(messages: List[BaseMessage]) -> Optional[AIMessage
                 logger.debug(f"[CASCADE] Permission denied: {provider}/{model_name}. Trying next...")
             elif "401" in error_str or "UNAUTHENTICATED" in error_str:
                 logger.debug(f"[CASCADE] Invalid API key: {provider}/{model_name}. Trying next...")
+            elif "timeout" in error_str.lower() or "timed out" in error_str.lower():
+                logger.debug(f"[CASCADE] Timeout: {provider}/{model_name}. Trying next...")
             else:
-                logger.debug(f"[CASCADE] Error: {provider}/{model_name}: {error_str[:100]}. Trying next...")
+                logger.debug(f"[CASCADE] Error: {provider}/{model_name}: {error_str[:120]}. Trying next...")
             continue
 
     # All models in cascade exhausted
