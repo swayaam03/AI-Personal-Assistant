@@ -5,7 +5,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
 from state.assistant_state import AssistantState
-from agents.assistant_agent import create_agent_model, SimulatedAgentModel
+from agents.assistant_agent import invoke_with_model_cascade, SimulatedAgentModel
 from prompts.system_prompts import get_system_message
 from tools import ALL_TOOLS
 
@@ -16,10 +16,12 @@ logger = logging.getLogger(__name__)
 def call_agent_node(state: AssistantState) -> dict:
     """
     Agent Node: Receives graph state, prepends system instructions,
-    and invokes the bound Gemini LLM model.
+    and invokes the Gemini LLM using the model cascade.
     
-    Returns:
-        State update dictionary containing the generated AIMessage.
+    Model Cascade Strategy:
+        1. Try each model in GEMINI_MODELS list (e.g. gemini-2.0-flash, gemini-2.0-flash-lite, ...)
+        2. If a model returns 429/404/403, skip it and try the next one.
+        3. If ALL models fail, fall back to the local SimulatedAgentModel.
     """
     messages = list(state["messages"])
     
@@ -27,16 +29,16 @@ def call_agent_node(state: AssistantState) -> dict:
     if not messages or not getattr(messages[0], "type", "") == "system":
         messages = [get_system_message()] + messages
 
-    try:
-        model = create_agent_model()
-        response = model.invoke(messages)
+    # Try the model cascade first
+    response = invoke_with_model_cascade(messages)
+    if response is not None:
         return {"messages": [response]}
-    except Exception as e:
-        # Silently fail-over to local agentic reasoning model for a clean terminal interface
-        logger.debug(f"Live Gemini API unavailable: {e}. Using Agentic Simulator.")
-        simulated_model = SimulatedAgentModel()
-        response = simulated_model.invoke(messages)
-        return {"messages": [response]}
+
+    # All live models exhausted -> fall back to local agentic reasoning
+    logger.debug("All models in cascade exhausted. Using local Agentic Simulator.")
+    simulated_model = SimulatedAgentModel()
+    response = simulated_model.invoke(messages)
+    return {"messages": [response]}
 
 
 # 2. Conditional Routing Edge Function
